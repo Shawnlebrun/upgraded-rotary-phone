@@ -1,0 +1,151 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version to release, e.g. v1.5.13'
+        required: true
+        default: 'v0.1.0'
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Build Changelog
+        id: build_changelog
+        uses: mikepenz/release-changelog-builder-action@v3
+        with:
+          configuration: "changelog.json"
+          toTag: ${{ github.event.inputs.version }}
+          commitMode: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: create changelog file
+        run: |
+          echo "Image: \`${{ env.IMAGE_NAME }}:${{ github.event.inputs.version }}\`" >> .changelog
+          echo "Image: \`${{ env.IMAGE_NAME }}:${{ github.event.inputs.version }}-ubi\`" >> .changelog
+          echo "Image: \`${{ env.IMAGE_NAME }}:${{ github.event.inputs.version }}-ubi-boringssl\`" >> .changelog
+          echo "${{ steps.build_changelog.outputs.changelog }}" >> .changelog
+
+      - name: Update Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          body_path: .changelog
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v3
+        with:
+          go-version-file: "go.mod"
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Update Docs
+        run: make docs.publish DOCS_VERSION=${{ github.event.inputs.version }} DOCS_ALIAS=latest
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+  promote:
+    name: Promote Container Image
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+        - tag_suffix: "" # distroless image
+        - tag_suffix: "-ubi" # ubi image
+        - tag_suffix: "-ubi-boringssl" # ubi image
+
+    permissions:
+      id-token: write
+      contents: write
+
+    env:
+      SOURCE_TAG: main${{ matrix.tag_suffix }}
+      RELEASE_TAG: ${{ github.event.inputs.version }}${{ matrix.tag_suffix }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v3
+        with:
+          go-version-file: "go.mod"
+
+      - name: Find the Go Cache
+        id: go
+        run: |
+          echo "::set-output name=build-cache::$(go env GOCACHE)"
+          echo "::set-output name=mod-cache::$(go env GOMODCACHE)"
+
+      - name: Cache the Go Build Cache
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.go.outputs.build-cache }}
+          key: ${{ runner.os }}-build-${{ github.sha }}-${{ hashFiles('**/go.sum') }}
+
+      - name: Cache Go Dependencies
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.go.outputs.mod-cache }}
+          key: ${{ runner.os }}-mod-${{ github.sha }}-${{ hashFiles('**/go.sum') }}
+
+      - name: Login to Docker
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Promote Container Image
+        run: make docker.promote
+
+      - name: Build release manifests
+        run: make manifests
+
+      - name: Sign promoted image
+        id: sign
+        uses: ./.github/actions/sign
+        with:
+          image-name: ${{ env.IMAGE_NAME }}
+          image-tag: ${{ env.RELEASE_TAG }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          files: |
+            provenance.${{ env.RELEASE_TAG }}.intoto.jsonl
+            sbom.${{ env.RELEASE_TAG }}.spdx.json
+            bin/deploy/manifests/external-secrets.yaml
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
